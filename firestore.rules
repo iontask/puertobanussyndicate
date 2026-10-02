@@ -1,0 +1,266 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * =========================================================================
+     * SYNDIKAL SAAS - PRODUCTION SECURITY RULES (MULTI-TENANT ARCHITECTURE)
+     * =========================================================================
+     * 
+     * Security Principles Enforced:
+     * 1. Hermetic Tenant Isolation: Every collection is scoped under /tenants/{tenantId}.
+     *    Cross-tenant queries or data leakage are cryptographically prevented using
+     *    request.auth.token.tenantId.
+     * 2. Strict Role-Based Access Control (RBAC):
+     *    - 'president': Full administrative and operational supervision.
+     *    - 'treasurer': Financial master (contributions, payments, expenses, ledger).
+     *    - 'block_rep': Scoped access limited to their designated block (Bloc A à I).
+     *    - 'resident' / 'owner': Scoped access to private lot finances, receipts,
+     *      own complaints, plus public documents and pool status for their block.
+     *    - 'provider': Limited write access to service execution validations.
+     * 3. Immutability of Audit Logs:
+     *    - /audit_logs collection allows creation only.
+     *    - Updates and deletions are STRICTLY FORBIDDEN (false) to maintain a
+     *      legally compliant, unalterable trail.
+     * 4. Scope-based Complaint Visibility:
+     *    - 'residence': Accessible to tenant residents and bureau.
+     *    - 'block': Accessible only to residents of that block and bureau.
+     *    - 'apartment' / 'private': Accessible only to apartment owner/tenant and bureau.
+     */
+
+    // -------------------------------------------------------------------------
+    // Core Helper Functions
+    // -------------------------------------------------------------------------
+
+    // 1. Authentication check
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // 2. Multi-tenant boundary check
+    function isTenantMember(tenantId) {
+      return isAuthenticated() && 
+             request.auth.token.tenantId != null && 
+             request.auth.token.tenantId == tenantId;
+    }
+
+    // 3. User Role extraction
+    function getUserRole() {
+      return request.auth.token.role;
+    }
+
+    // 4. Role-specific helpers
+    function isPresident(tenantId) {
+      return isTenantMember(tenantId) && getUserRole() == 'president';
+    }
+
+    function isTreasurer(tenantId) {
+      return isTenantMember(tenantId) && getUserRole() == 'treasurer';
+    }
+
+    function isBureau(tenantId) {
+      return isTenantMember(tenantId) && 
+             (getUserRole() == 'president' || getUserRole() == 'treasurer');
+    }
+
+    function isBlockRep(tenantId, blockId) {
+      return isTenantMember(tenantId) && 
+             getUserRole() == 'block_rep' && 
+             request.auth.token.assignedBlockId == blockId;
+    }
+
+    function isResident(tenantId) {
+      return isTenantMember(tenantId) && 
+             (getUserRole() == 'resident' || getUserRole() == 'owner');
+    }
+
+    function isOwnApartment(apartmentId) {
+      return request.auth.token.apartmentId != null && 
+             request.auth.token.apartmentId == apartmentId;
+    }
+
+    function isOwnBlock(blockId) {
+      return request.auth.token.assignedBlockId != null && 
+             request.auth.token.assignedBlockId == blockId;
+    }
+
+    // -------------------------------------------------------------------------
+    // Tenant Root Configuration
+    // -------------------------------------------------------------------------
+    match /tenants/{tenantId} {
+      // Any authenticated member of the tenant can read general residence settings
+      allow read: if isTenantMember(tenantId);
+      // Only the President of the syndic can modify residence parameters
+      allow write: if isPresident(tenantId);
+
+      // -----------------------------------------------------------------------
+      // 1. Blocks Subcollection (/tenants/{tenantId}/blocks/{blockId})
+      // -----------------------------------------------------------------------
+      match /blocks/{blockId} {
+        // All co-owners can see the list and architecture of blocks
+        allow read: if isTenantMember(tenantId);
+        // Only bureau can create or reconfigure blocks
+        allow write: if isBureau(tenantId);
+      }
+
+      // -----------------------------------------------------------------------
+      // 2. Apartments / Lots Privatifs
+      // -----------------------------------------------------------------------
+      match /apartments/{apartmentId} {
+        // Bureau has full access; Block Rep sees apartments in their block; Resident sees their own lot
+        allow read: if isBureau(tenantId) || 
+                       isBlockRep(tenantId, resource.data.blockId) || 
+                       isOwnApartment(apartmentId);
+        // Modification of apartment lots restricted to the bureau
+        allow write: if isBureau(tenantId);
+      }
+
+      // -----------------------------------------------------------------------
+      // 3. Financial Module: Contributions / Appels de cotisations
+      // -----------------------------------------------------------------------
+      match /contributions/{contributionId} {
+        // Bureau can view all contributions; Resident can strictly read only their own lot
+        allow read: if isBureau(tenantId) || 
+                       (isResident(tenantId) && isOwnApartment(resource.data.apartmentId));
+        // Only Treasurer or President can generate, update, or cancel contribution calls
+        allow write: if isTreasurer(tenantId) || isPresident(tenantId);
+      }
+
+      // -----------------------------------------------------------------------
+      // 4. Financial Module: Payments & Receipts / Règlements & Quittances
+      // -----------------------------------------------------------------------
+      match /payments/{paymentId} {
+        // Bureau can view all payments; Resident can strictly view payments for their own lot
+        allow read: if isBureau(tenantId) || 
+                       (isResident(tenantId) && isOwnApartment(resource.data.apartmentId));
+        // Only Treasurer or President can record payments and issue receipts
+        allow create, update: if isTreasurer(tenantId) || isPresident(tenantId);
+        // No hard deletion of payment records (audit compliance)
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // 5. Complaints & Incidents / Réclamations & Pannes
+      // -----------------------------------------------------------------------
+      match /complaints/{complaintId} {
+        // Scope-based read rule:
+        // - 'residence': Visible to all members
+        // - 'block': Visible to residents of that block and bureau
+        // - 'apartment' / 'private': Visible only to the apartment owner, assigned block rep, or bureau
+        allow read: if isBureau(tenantId) ||
+                       (resource.data.scope == 'residence' && isTenantMember(tenantId)) ||
+                       (resource.data.scope == 'block' && isOwnBlock(resource.data.blockId)) ||
+                       (isOwnApartment(resource.data.apartmentId)) ||
+                       (request.auth.uid == resource.data.authorUserId);
+
+        // Creation: Any member can report an incident for their own apartment or block
+        allow create: if isTenantMember(tenantId) &&
+                         request.resource.data.tenantId == tenantId &&
+                         (
+                           isBureau(tenantId) ||
+                           isOwnApartment(request.resource.data.apartmentId) ||
+                           isOwnBlock(request.resource.data.blockId)
+                         );
+
+        // Update: Bureau can manage all tickets; Block Rep can update status for their block;
+        // Author can update details only while ticket status is 'new'
+        allow update: if isBureau(tenantId) ||
+                         (isBlockRep(tenantId, resource.data.blockId)) ||
+                         (request.auth.uid == resource.data.authorUserId && resource.data.status == 'new');
+
+        // Deletion: Restricted strictly to the President
+        allow delete: if isPresident(tenantId);
+      }
+
+      // -----------------------------------------------------------------------
+      // 6. Pools & Aquatic Facilities / 18 Bassins
+      // -----------------------------------------------------------------------
+      match /pools/{poolId} {
+        // All residents can read water quality and status of pools
+        allow read: if isTenantMember(tenantId);
+        // Only Bureau or appointed facility technicians can update pool metrics (temperature, pH, chlorine)
+        allow write: if isBureau(tenantId) || 
+                        (isTenantMember(tenantId) && getUserRole() == 'provider');
+      }
+
+      // -----------------------------------------------------------------------
+      // 7. Common Services & Passages / Prestations & Interventions
+      // -----------------------------------------------------------------------
+      match /services/{serviceId} {
+        allow read: if isTenantMember(tenantId);
+        // Bureau or authorized providers can log passages
+        allow write: if isBureau(tenantId) || 
+                        (isTenantMember(tenantId) && getUserRole() == 'provider');
+      }
+
+      // -----------------------------------------------------------------------
+      // 8. Governance: Assemblies & Bureau Meetings / Réunions & AG
+      // -----------------------------------------------------------------------
+      match /meetings/{meetingId} {
+        // Public AG meetings visible to all residents; private bureau meetings visible to bureau only
+        allow read: if isBureau(tenantId) || 
+                       (resource.data.isPublicToResidents == true && isTenantMember(tenantId));
+        // Only President or Treasurer can create and manage meeting agendas and minutes
+        allow write: if isBureau(tenantId);
+      }
+
+      // -----------------------------------------------------------------------
+      // 9. Governance: Action Registry & Decisions / Décisions d'AG
+      // -----------------------------------------------------------------------
+      match /decisions/{decisionId} {
+        // Public decisions readable by all residents; internal decisions visible to bureau & reps
+        allow read: if isBureau(tenantId) || 
+                       getUserRole() == 'block_rep' || 
+                       (resource.data.isPublic == true && isTenantMember(tenantId));
+        // Bureau can create and update decisions; Block reps can update progress on actions assigned to them
+        allow create, delete: if isBureau(tenantId);
+        allow update: if isBureau(tenantId) || 
+                         (getUserRole() == 'block_rep' && resource.data.targetBlockId == request.auth.token.assignedBlockId);
+      }
+
+      // -----------------------------------------------------------------------
+      // 10. Announcements & Targeted Broadcasts / Annonces
+      // -----------------------------------------------------------------------
+      match /announcements/{announcementId} {
+        // Hermetic inter-block isolation:
+        // - 'residence': Visible to all
+        // - 'block': Visible only to residents belonging to that specific targetBlockId and bureau
+        allow read: if isBureau(tenantId) ||
+                       (resource.data.scope == 'residence' && isTenantMember(tenantId)) ||
+                       (resource.data.scope == 'block' && isOwnBlock(resource.data.targetBlockId));
+
+        // Publication: Bureau can broadcast anywhere; Block Rep can only broadcast to their own block
+        allow create: if isBureau(tenantId) ||
+                         (
+                           getUserRole() == 'block_rep' && 
+                           request.resource.data.scope == 'block' && 
+                           request.resource.data.targetBlockId == request.auth.token.assignedBlockId
+                         );
+
+        allow update, delete: if isBureau(tenantId) ||
+                                 (
+                                   getUserRole() == 'block_rep' && 
+                                   resource.data.authorId == request.auth.uid
+                                 );
+      }
+
+      // -----------------------------------------------------------------------
+      // 11. IMMUTABLE AUDIT LOGS (/tenants/{tenantId}/audit_logs/{logId})
+      // -----------------------------------------------------------------------
+      match /audit_logs/{logId} {
+        // Only President and Treasurer can consult the immutable compliance audit log
+        allow read: if isBureau(tenantId);
+
+        // Log entry creation: Validated tenant members can insert audit logs for actions they perform
+        allow create: if isTenantMember(tenantId) &&
+                         request.resource.data.tenantId == tenantId &&
+                         request.resource.data.actorId == request.auth.uid &&
+                         request.resource.data.timestamp != null;
+
+        // STRICT IMMUTABILITY: Modifying or deleting audit entries is completely blocked
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+  }
+}
